@@ -1,36 +1,31 @@
 import React, { useCallback, useMemo, useState } from 'react';
 
-import dynamic from 'next/dynamic';
 import useTranslation from 'next-translate/useTranslation';
-import { shallowEqual, useSelector } from 'react-redux';
+import { shallowEqual, useDispatch, useSelector } from 'react-redux';
 
 import styles from '../styles/ContextMenu.module.scss';
 
 import Spinner from '@/components/dls/Spinner/Spinner';
-import { SaveBookmarkType } from '@/components/Verse/SaveBookmarkModal/SaveBookmarkModal';
 import useGlobalReadingBookmark from '@/hooks/auth/useGlobalReadingBookmark';
 import useMappedBookmark from '@/hooks/useMappedBookmark';
 import BookmarkStarIcon from '@/icons/bookmark-star.svg';
 import UnBookmarkedIcon from '@/icons/unbookmarked.svg';
-import { selectGuestReadingBookmark } from '@/redux/slices/guestBookmark';
+import { selectGuestReadingBookmark, setGuestReadingBookmark } from '@/redux/slices/guestBookmark';
 import { selectQuranReaderStyles } from '@/redux/slices/QuranReader/styles';
 import BookmarkType from '@/types/BookmarkType';
 import { getMushafId } from '@/utils/api';
+import { deleteBookmarkById, setReadingBookmark } from '@/utils/auth/api';
 import { isLoggedIn } from '@/utils/auth/login';
 import { logButtonClick } from '@/utils/eventLogger';
-
-const SaveBookmarkModal = dynamic(
-  () => import('@/components/Verse/SaveBookmarkModal/SaveBookmarkModal'),
-  { ssr: false },
-);
 
 interface PageBookmarkActionProps {
   pageNumber: number;
 }
 
 /**
- * Component for bookmarking a Quran page
- * Opens SaveBookmarkModal for both logged-in users and guests
+ * Component for bookmarking a Quran page.
+ * Directly toggles the single reading-position bookmark without opening a modal,
+ * making navigation back to the last-read location a one-click action.
  *
  * @returns {JSX.Element} A React component that displays a bookmark icon for the current page
  */
@@ -39,13 +34,14 @@ const PageBookmarkAction: React.FC<PageBookmarkActionProps> = React.memo(({ page
   const quranReaderStyles = useSelector(selectQuranReaderStyles, shallowEqual);
   const mushafId = getMushafId(quranReaderStyles.quranFont, quranReaderStyles.mushafLines).mushaf;
   const isGuest = !isLoggedIn();
+  const dispatch = useDispatch();
 
   const { t } = useTranslation();
 
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isToggling, setIsToggling] = useState(false);
 
   // Use global reading bookmark hook for logged-in users
-  const { readingBookmark, isLoading } = useGlobalReadingBookmark(mushafId);
+  const { readingBookmark, mutate, isLoading } = useGlobalReadingBookmark(mushafId);
 
   // Use the reusable mapping hook for cross-mushaf bookmark handling (guests only)
   const {
@@ -80,16 +76,46 @@ const PageBookmarkAction: React.FC<PageBookmarkActionProps> = React.memo(({ page
     pageNumber,
   ]);
 
-  const onModalClose = useCallback((): void => {
-    setIsModalOpen(false);
-  }, []);
+  const onBookmarkClicked = useCallback(async (): Promise<void> => {
+    if (isToggling) return;
 
-  const onBookmarkClicked = useCallback((): void => {
-    logButtonClick('context_menu_page_bookmark_open');
-    setIsModalOpen(true);
-  }, []);
+    logButtonClick('context_menu_page_bookmark_toggle');
+    setIsToggling(true);
 
-  const isLoadingAny = isLoading || isMappingLoading;
+    try {
+      if (isPageBookmarked) {
+        // Remove the reading bookmark
+        if (isGuest) {
+          dispatch(setGuestReadingBookmark(null));
+        } else if (readingBookmark && 'id' in readingBookmark) {
+          await deleteBookmarkById(readingBookmark.id);
+          await mutate(null, { revalidate: false });
+        }
+      } else {
+        // Set this page as the reading bookmark
+        if (isGuest) {
+          dispatch(
+            setGuestReadingBookmark({
+              key: pageNumber,
+              type: BookmarkType.Page,
+              mushafId,
+              createdAt: new Date().toISOString(),
+            }),
+          );
+        } else {
+          const savedBookmark = await setReadingBookmark(pageNumber, mushafId, BookmarkType.Page);
+          await mutate(savedBookmark, { revalidate: false });
+        }
+      }
+    } catch {
+      // Silently ignore errors; the UI will naturally reflect the correct server state
+      // on the next revalidation since we do not apply optimistic updates here.
+    } finally {
+      setIsToggling(false);
+    }
+  }, [isToggling, isPageBookmarked, isGuest, readingBookmark, pageNumber, mushafId, dispatch, mutate]);
+
+  const isLoadingAny = isLoading || isMappingLoading || isToggling;
 
   let bookmarkIcon = <Spinner />;
   if (!isLoadingAny) {
@@ -101,25 +127,17 @@ const PageBookmarkAction: React.FC<PageBookmarkActionProps> = React.memo(({ page
   }
 
   return (
-    <>
-      <button
-        type="button"
-        className={styles.bookmarkButton}
-        onClick={onBookmarkClicked}
-        disabled={isLoadingAny}
-        aria-label={
-          isPageBookmarked ? t('quran-reader:remove-bookmark') : t('quran-reader:add-bookmark')
-        }
-      >
-        {bookmarkIcon}
-      </button>
-      <SaveBookmarkModal
-        isOpen={isModalOpen}
-        onClose={onModalClose}
-        type={SaveBookmarkType.PAGE}
-        pageNumber={pageNumber}
-      />
-    </>
+    <button
+      type="button"
+      className={styles.bookmarkButton}
+      onClick={onBookmarkClicked}
+      disabled={isLoadingAny}
+      aria-label={
+        isPageBookmarked ? t('quran-reader:remove-bookmark') : t('quran-reader:add-bookmark')
+      }
+    >
+      {bookmarkIcon}
+    </button>
   );
 });
 
